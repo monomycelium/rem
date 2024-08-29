@@ -1,28 +1,10 @@
 const std = @import("std");
+const Server = @import("server.zig").Server;
 const os = std.os;
 const log = std.log;
 const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-
-const c = @cImport({
-    @cInclude("sys/wait.h"); // WIFEXITED and WEXITSTATUS
-});
-
-const Server = struct {
-    const Self = @This();
-
-    n: usize,
-
-    pub fn init() Self {
-        return Self{ .n = 0 };
-    }
-
-    pub fn waitFn(self: *Self) bool {
-        self.n += 1;
-        return false;
-    }
-};
 
 fn copySentinel(
     comptime T: type,
@@ -40,8 +22,8 @@ fn execute(
     args: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     context: anytype,
-    comptime waitFn: fn (@TypeOf(context)) bool,
-) posix.ExecveError!u32 {
+    comptime waitFn: fn (@TypeOf(context)) anyerror!bool,
+) anyerror!u32 {
     const path = args[0].?;
     var ret: u32 = 0;
 
@@ -52,25 +34,26 @@ fn execute(
         return err; // is this allowed?
     } else {
         log.info("executing command with pid: {}", .{fork_pid});
-        var wait_result = posix.waitpid(fork_pid, c.WNOHANG);
+        var wait_result = posix.waitpid(fork_pid, posix.W.NOHANG);
 
         outer: while (wait_result.pid != fork_pid) {
             log.info("received: {}", .{wait_result.pid});
 
-            if (waitFn(context)) {
+            if (try waitFn(context)) {
                 log.info("killing process {}", .{fork_pid});
                 // TODO implement killing process
                 wait_result = posix.waitpid(fork_pid, 0);
                 break :outer;
             }
 
-            std.time.sleep(100 * std.time.ns_per_ms);
-            wait_result = posix.waitpid(fork_pid, c.WNOHANG);
+            std.time.sleep(100 * std.time.ns_per_ms); // poll(2) can handle this
+            wait_result = posix.waitpid(fork_pid, posix.W.NOHANG);
         }
 
-        const status = @as(c_int, @bitCast(wait_result.status));
-        if (c.WIFEXITED(status)) { // the macros ensure that the correct bits are used as the exit code
-            ret = @bitCast(c.WEXITSTATUS(status));
+        const status = wait_result.status;
+        if (posix.W.IFEXITED(status)) {
+            // the macros ensure that the correct bits are used as the exit code
+            ret = posix.W.EXITSTATUS(status);
             log.info("command exited with code: {}", .{ret});
         }
     }
@@ -79,16 +62,16 @@ fn execute(
 }
 
 const ArgumentResult = struct {
+    const Self = @This();
+
     buffer: []u8,
     argv: [:null]?[*:0]u8,
-};
 
-// remember to call free on `buffer` and `argv`!
 // i only did this because passing the arguments directly from argv gave me EFAULT
 // TODO find if putting argv on heap is necessary
-fn argvFromSlice(
-    alloc: Allocator,
+fn init(
     slice: []const [*:0]const u8,
+    alloc: Allocator,
 ) !ArgumentResult {
     var res: ArgumentResult = undefined;
 
@@ -121,9 +104,23 @@ fn argvFromSlice(
     return res;
 }
 
+    fn deinit(self: *Self, alloc: Allocator) void {
+        alloc.free(self.buffer);
+        alloc.free(self.argv);
+    }
+};
+
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
-    var server = Server.init(); // TODO use TCP sockets
+    const addr = std.net.Address.parseIp("0.0.0.0", 8080) catch unreachable;
+    var server = try Server.init(alloc, addr);
+
+    std.debug.print("listening on {}!\n", .{addr});
+    const connection = try server.server.accept();
+    const writer = connection.stream.writer();
+    try writer.print("Hello, world!\n", .{});
+    connection.stream.close();
+    std.debug.print("wrote to server!\n", .{});
 
     // argument after the current executable path will be passed as argv
     if (os.argv.len < 2) {
@@ -131,9 +128,11 @@ pub fn main() !void {
         return error.InvalidUsage;
     }
 
-    const res: ArgumentResult = try argvFromSlice(alloc, os.argv[1..]);
-    const envs: ?[*:0]const u8 = null; // TODO propagate environment
+    const res = try ArgumentResult.init(os.argv[1..], alloc);
+    const envs: ?[*:0]const u8 = null;
+    // TODO propagate environment using `std.os.environ`
     _ = try execute(res.argv, @ptrCast(&envs), &server, Server.waitFn);
 
     log.info("called callback {} times", .{server.n});
+    server.deinit();
 }
