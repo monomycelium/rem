@@ -6,6 +6,7 @@ const posix = std.posix;
 const Map = std.ArrayHashMapUnmanaged(net.Server.Connection, posix.pollfd, ConnectionContext, false);
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const execute = @import("execute.zig");
 
 pub const Server = struct {
     const Self = @This();
@@ -41,7 +42,7 @@ pub const Server = struct {
         self.fds.deinit(self.alloc);
     }
 
-    pub fn waitFn(self: *Self) !bool {
+    pub fn waitFn(self: *Self) !?execute.Payload {
         self.n += 1;
         std.debug.print("called callback", .{});
         std.debug.assert(self.fds.entries.len > 0);
@@ -50,7 +51,7 @@ pub const Server = struct {
         const events = try posix.poll(fds, 100); // wait forever
         std.debug.print(" and done polling\n", .{});
 
-        if (events == 0) return false;
+        if (events == 0) return null;
 
         if (ready(fds[0])) |_| {
             const conn: net.Server.Connection = try self.server.accept();
@@ -67,25 +68,36 @@ pub const Server = struct {
             std.debug.print("\rsender {} sent: {s}\n", .{ connection.address, message });
 
             if (message.len == 0) {
-                std.debug.print("removing sender {}\n", .{connection.address});
                 self.deleteConnection(connection);
-                connection.stream.close();
+                continue;
             }
 
-            // TODO convert to enum and change return type
-            const str = switch (message[0]) {
-                'k' => "killing process",
-                'r' => "reloading process",
-                'o' => "watching stdout",
-                'n' => "no longer watching process",
-                'e' => "watching stderr",
-                'q' => "no longer watching stderr",
-                else => "unknown command", // should it close?
+            const command = std.meta.intToEnum(
+                execute.Command,
+                message[0],
+            ) catch {
+                // invalid enum tag
+                std.debug.print("invalid enum tag; ", .{});
+                self.deleteConnection(connection);
+                continue;
             };
-            std.debug.print("{s}\n", .{str});
+
+            const payload = execute.Payload.getPayload(
+                connection.stream.reader(),
+                self.alloc,
+                command,
+            ) catch |e| switch (e) {
+                error.InvalidPayload, error.EndOfStream => {
+                    std.debug.print("invalid payload; ", .{});
+                    self.deleteConnection(connection);
+                    continue;
+                },
+                else => return e,
+            };
+            std.debug.print("{any}\n", .{payload});
         };
 
-        return false;
+        return null;
     }
 
     pub fn get_fd(self: Self) posix.socket_t {
@@ -117,6 +129,8 @@ pub const Server = struct {
     }
 
     fn deleteConnection(self: *Self, connection: net.Server.Connection) void {
+        std.debug.print("removing sender {}\n", .{connection.address});
+        connection.stream.close();
         std.debug.assert(self.fds.swapRemove(connection));
     }
 
