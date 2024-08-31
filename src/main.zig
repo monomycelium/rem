@@ -18,6 +18,7 @@ fn copySentinel(
     return i;
 }
 
+// TODO read stdout and stderr
 fn execute(
     args: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -37,8 +38,6 @@ fn execute(
         var wait_result = posix.waitpid(fork_pid, posix.W.NOHANG);
 
         outer: while (wait_result.pid != fork_pid) {
-            log.info("received: {}", .{wait_result.pid});
-
             if (try waitFn(context)) {
                 log.info("killing process {}", .{fork_pid});
                 // TODO implement killing process
@@ -46,7 +45,7 @@ fn execute(
                 break :outer;
             }
 
-            std.time.sleep(100 * std.time.ns_per_ms); // poll(2) can handle this
+            // std.time.sleep(100 * std.time.ns_per_ms); // poll(2) can handle this
             wait_result = posix.waitpid(fork_pid, posix.W.NOHANG);
         }
 
@@ -67,42 +66,42 @@ const ArgumentResult = struct {
     buffer: []u8,
     argv: [:null]?[*:0]u8,
 
-// i only did this because passing the arguments directly from argv gave me EFAULT
-// TODO find if putting argv on heap is necessary
-fn init(
-    slice: []const [*:0]const u8,
-    alloc: Allocator,
-) !ArgumentResult {
-    var res: ArgumentResult = undefined;
+    // i only did this because passing the arguments directly from argv gave me EFAULT
+    // TODO find if putting argv on heap is necessary
+    fn init(
+        slice: []const [*:0]const u8,
+        alloc: Allocator,
+    ) !ArgumentResult {
+        var res: ArgumentResult = undefined;
 
-    res.argv = try alloc.allocSentinel(?[*:0]u8, slice.len, null);
-    errdefer alloc.free(res.argv);
+        res.argv = try alloc.allocSentinel(?[*:0]u8, slice.len, null);
+        errdefer alloc.free(res.argv);
 
-    // allocate the buffer
+        // allocate the buffer
 
-    var n: usize = 0;
-    for (0..res.argv.len) |i| {
-        const ptr = os.argv[i + 1];
-        const len = mem.indexOfSentinel(u8, 0, ptr);
-        n += len + 1;
+        var n: usize = 0;
+        for (0..res.argv.len) |i| {
+            const ptr = os.argv[i + 1];
+            const len = mem.indexOfSentinel(u8, 0, ptr);
+            n += len + 1;
+        }
+
+        res.buffer = try alloc.alloc(u8, n);
+        errdefer alloc.free(res.buffer);
+
+        // copy the arguments to the buffer
+
+        var x: usize = 0;
+        for (0..res.argv.len) |i| {
+            const ptr: [*:0]u8 = @ptrCast(&res.buffer[x]);
+            res.argv[i] = ptr;
+            const len: usize = copySentinel(u8, 0, ptr, slice[i]);
+            x += len + 1;
+        }
+        std.debug.assert(x == n);
+
+        return res;
     }
-
-    res.buffer = try alloc.alloc(u8, n);
-    errdefer alloc.free(res.buffer);
-
-    // copy the arguments to the buffer
-
-    var x: usize = 0;
-    for (0..res.argv.len) |i| {
-        const ptr: [*:0]u8 = @ptrCast(&res.buffer[x]);
-        res.argv[i] = ptr;
-        const len: usize = copySentinel(u8, 0, ptr, slice[i]);
-        x += len + 1;
-    }
-    std.debug.assert(x == n);
-
-    return res;
-}
 
     fn deinit(self: *Self, alloc: Allocator) void {
         alloc.free(self.buffer);
@@ -114,13 +113,6 @@ pub fn main() !void {
     const alloc = std.heap.c_allocator;
     const addr = std.net.Address.parseIp("0.0.0.0", 8080) catch unreachable;
     var server = try Server.init(alloc, addr);
-
-    std.debug.print("listening on {}!\n", .{addr});
-    const connection = try server.server.accept();
-    const writer = connection.stream.writer();
-    try writer.print("Hello, world!\n", .{});
-    connection.stream.close();
-    std.debug.print("wrote to server!\n", .{});
 
     // argument after the current executable path will be passed as argv
     if (os.argv.len < 2) {

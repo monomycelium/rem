@@ -3,7 +3,9 @@ const net = std.net;
 const fs = std.fs;
 const os = std.os;
 const posix = std.posix;
-const Map = std.AutoHashMap(net.Server.Connection, void);
+const Map = std.ArrayHashMapUnmanaged(net.Server.Connection, posix.pollfd, ConnectionContext, false);
+const mem = std.mem;
+const Allocator = mem.Allocator;
 
 pub const Server = struct {
     const Self = @This();
@@ -11,46 +13,134 @@ pub const Server = struct {
 
     n: usize,
     server: net.Server,
-    fd_s: Map,
+    fds: Map,
+    alloc: Allocator,
 
-    pub fn init(alloc: std.mem.Allocator, address: net.Address) !Self {
+    pub fn init(alloc: Allocator, address: net.Address) !Self {
         var self: Self = undefined;
-        
-        self.fd_s = Map.init(alloc);
+
+        self.alloc = alloc;
         self.n = 0;
         self.server = try net.Address.listen(
             address,
             .{ .reuse_address = true },
         );
+        self.fds = Map{};
+
+        const connection = net.Server.Connection{
+            .address = self.server.listen_address,
+            .stream = self.server.stream,
+        };
+        try self.insertConnection(connection);
 
         return self;
     }
 
     pub fn deinit(self: *Self) void {
         self.server.deinit();
-        self.fd_s.deinit();
+        self.fds.deinit(self.alloc);
     }
 
     pub fn waitFn(self: *Self) !bool {
         self.n += 1;
-        std.debug.print("called callback\n", .{});
+        std.debug.print("called callback", .{});
+        std.debug.assert(self.fds.entries.len > 0);
 
-        // should this be saved in Server?
-        var fds: [1]posix.pollfd = undefined;
-        fds[0].fd = self.get_fd();
-        fds[0].events = posix.POLL.IN;
-        _ = try posix.poll(fds[0..], -1);
+        const fds: []posix.pollfd = self.fds.values();
+        const events = try posix.poll(fds, 100); // wait forever
+        std.debug.print(" and done polling\n", .{});
 
-        if (fds[0].revents & posix.POLL.IN != 0) { // TODO update fd_s
-            std.debug.print("got a connection! see you!\n", .{});
-            return true;
+        if (events == 0) return false;
+
+        if (ready(fds[0])) |_| {
+            const conn: net.Server.Connection = try self.server.accept();
+            std.debug.print("sender {} connected\n", .{conn.address});
+            try self.insertConnection(conn);
         }
 
-        std.debug.print("unexpected event!\n", .{});
+        for (1..fds.len) |i| if (ready(fds[i])) |fd| {
+            const connection = self.connectionFromHandle(fd).?;
+            std.debug.print("reading stuff...", .{});
+            var buffer: [1]u8 = undefined;
+            const n = try connection.stream.read(buffer[0..]);
+            const message = buffer[0..n];
+            std.debug.print("\rsender {} sent: {s}\n", .{ connection.address, message });
+
+            if (message.len == 0) {
+                std.debug.print("removing sender {}\n", .{connection.address});
+                self.deleteConnection(connection);
+                connection.stream.close();
+            }
+
+            // TODO convert to enum and change return type
+            const str = switch (message[0]) {
+                'k' => "killing process",
+                'r' => "reloading process",
+                'o' => "watching stdout",
+                'n' => "no longer watching process",
+                'e' => "watching stderr",
+                'q' => "no longer watching stderr",
+                else => "unknown command", // should it close?
+            };
+            std.debug.print("{s}\n", .{str});
+        };
+
         return false;
     }
 
     pub fn get_fd(self: Self) posix.socket_t {
         return self.server.stream.handle;
+    }
+
+    fn get_pollfd(connection: net.Server.Connection) posix.pollfd {
+        return posix.pollfd{
+            .fd = connection.stream.handle,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        };
+    }
+
+    fn insertConnection(self: *Self, connection: net.Server.Connection) !void {
+        return self.fds.putNoClobber(
+            self.alloc,
+            connection,
+            get_pollfd(connection),
+        );
+    }
+
+    /// Returns connection with undefined address.
+    fn dummyConnection(fd: posix.socket_t) net.Server.Connection {
+        return net.Server.Connection{
+            .address = undefined,
+            .stream = net.Stream{ .handle = fd },
+        };
+    }
+
+    fn deleteConnection(self: *Self, connection: net.Server.Connection) void {
+        std.debug.assert(self.fds.swapRemove(connection));
+    }
+
+    fn connectionFromHandle(self: Self, fd: posix.socket_t) ?net.Server.Connection {
+        const dummy_connection = dummyConnection(fd);
+        return self.fds.getKey(dummy_connection);
+    }
+
+    fn ready(fd: posix.pollfd) ?posix.socket_t {
+        return if (fd.revents & posix.POLL.IN != 0) fd.fd else null;
+    }
+};
+
+// inspired by https://stackoverflow.com/a/77609482
+// hashing context that only considers socket descriptor
+const ConnectionContext = struct {
+    const Self = @This();
+    const Connection = net.Server.Connection;
+
+    pub fn hash(_: Self, key: Connection) u32 { // is a cast good enough?
+        return @truncate(std.hash.Wyhash.hash(0, mem.asBytes(&key.stream.handle)));
+    }
+
+    pub fn eql(_: Self, a: Connection, b: Connection, _: usize) bool {
+        return a.stream.handle == b.stream.handle;
     }
 };
