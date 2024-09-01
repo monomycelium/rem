@@ -136,6 +136,7 @@ pub const Command = enum(u8) {
     watch = 'w',
     stderr = 'e',
     upload = 'u',
+    exit = 'q',
 
     pub fn which(self: @This()) []const u8 {
         return switch (self) {
@@ -144,6 +145,7 @@ pub const Command = enum(u8) {
             .watch => "watching stdout",
             .stderr => "watching stderr",
             .upload => "updating binary",
+            .exit => "exiting server",
         };
     }
 };
@@ -155,6 +157,7 @@ pub const Payload = union(Command) {
     watch: bool,
     stderr: bool,
     upload: Executable,
+    exit: void,
 
     // map '0' to false and '1' to true
     fn readBool(reader: anytype) !bool {
@@ -174,6 +177,7 @@ pub const Payload = union(Command) {
             .watch => Self{ .watch = try readBool(reader) },
             .stderr => Self{ .stderr = try readBool(reader) },
             .upload => Self{ .upload = try Executable.read(reader, allocator) },
+            .exit => Self{ .exit = {} },
         };
     }
 
@@ -215,6 +219,11 @@ pub fn execute(
                         const signal = @intFromEnum(sig);
                         std.debug.print("killing process {} with {}\n", .{ fork_pid, signal });
                         try posix.kill(fork_pid, signal);
+                    },
+                    .exit => {
+                        try posix.kill(fork_pid, os.linux.SIG.INT);
+                        wait_result = posix.waitpid(fork_pid, 0);
+                        return 0; // extract status...
                     },
                     else => {}, // TODO handle other commands
                 }

@@ -10,7 +10,10 @@ const Allocator = mem.Allocator;
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
     const addr = std.net.Address.parseIp("0.0.0.0", 8080) catch unreachable;
+
     var server = try Server.init(alloc, addr);
+    defer server.deinit();
+    log.info("listening at {}", .{server.server.listen_address});
 
     // argument after the current executable path will be passed as argv
     if (os.argv.len < 2) {
@@ -26,5 +29,4 @@ pub fn main() !void {
     _ = try execute.execute(path, res.argv, @ptrCast(&envs), &server, Server.waitFn);
 
     log.info("called callback {} times", .{server.n});
-    server.deinit();
 }
