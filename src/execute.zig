@@ -74,6 +74,7 @@ pub const Signal = enum(u8) {
     fpe = 8,
     hup = 1,
     ill = 4,
+    int = 2,
     kill = 9,
     pipe = 13,
     quit = 3,
@@ -82,10 +83,12 @@ pub const Signal = enum(u8) {
     trap = 5,
 
     pub fn read(reader: anytype) !@This() {
-        return std.meta.intToEnum(
-            @This(),
-            try reader.readByte(),
-        );
+        var buffer: [3]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(buffer[0..]);
+        try reader.streamUntilDelimiter(fbs.writer(), '\n', buffer.len);
+        const tag_int = try std.fmt.parseInt(u8, fbs.getWritten(), 10);
+
+        return std.meta.intToEnum(@This(), tag_int);
     }
 };
 
@@ -112,7 +115,7 @@ pub const Executable = struct {
         self.alloc = allocator;
         self.meta = try reader.readInt(posix.mode_t, .big);
 
-        const n: usize = try reader.readInt(usize, .big);
+        const n: usize = @intCast(try reader.readInt(u64, .big));
         const data: []u8 = try allocator.alloc(u8, n);
         errdefer self.alloc.free(data);
 
@@ -137,7 +140,7 @@ pub const Command = enum(u8) {
     pub fn which(self: @This()) []const u8 {
         return switch (self) {
             .kill => "killing process",
-            .reload => "reloading process",
+            .reload => "reloading process", // can be used to start process as well
             .watch => "watching stdout",
             .stderr => "watching stderr",
             .upload => "updating binary",
@@ -183,6 +186,9 @@ pub const Payload = union(Command) {
 };
 
 // TODO read stdout and stderr using pipes...
+// TODO decide if this should be handled by waitFn using std.process.Child
+// TODO let poll(2) handle every event using signalfd or use libev...
+// TODO decide if every payload should be ended by '\n' or non-blocking sockets should be used
 pub fn execute(
     path: [:0]const u8, // path to executable
     args: [*:null]const ?[*:0]const u8,
@@ -201,8 +207,19 @@ pub fn execute(
         log.info("executing command with pid: {}", .{fork_pid});
         var wait_result = posix.waitpid(fork_pid, posix.W.NOHANG);
 
+        // "wait" until child has actually exited
         while (wait_result.pid != fork_pid) {
-            if (try waitFn(context)) |payload| payload.deinit();
+            if (try waitFn(context)) |payload| {
+                switch (payload) {
+                    .kill => |sig| {
+                        const signal = @intFromEnum(sig);
+                        std.debug.print("killing process {} with {}\n", .{ fork_pid, signal });
+                        try posix.kill(fork_pid, signal);
+                    },
+                    else => {}, // TODO handle other commands
+                }
+                payload.deinit();
+            }
 
             // std.time.sleep(100 * std.time.ns_per_ms); // poll(2) can handle this
             wait_result = posix.waitpid(fork_pid, posix.W.NOHANG);

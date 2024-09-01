@@ -95,6 +95,7 @@ pub const Server = struct {
                 else => return e,
             };
             std.debug.print("{any}\n", .{payload});
+            return payload;
         };
 
         return null;
